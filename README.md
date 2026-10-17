@@ -1,6 +1,6 @@
-# cufx — one shared operation catalog
+# try — one shared operation catalog
 
-cufx is a media pipeline with a single catalog at its center. Upload a file or
+try is a media pipeline with a single catalog at its center. Upload a file or
 paste a URL; every operation is a step that reads the previous step's result
 from the catalog and writes a new catalog object. Chained jobs run entirely on
 the server — nothing is re-uploaded between steps.
