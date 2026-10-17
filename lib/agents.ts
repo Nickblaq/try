@@ -1,263 +1,340 @@
+// Researcher and Synthesizer agents plus every prompt the pipeline uses.
+// The model itself scores each observation it writes (persistence + scope),
+// so routing decisions come out of the same call that produced the content.
+
+import { randomUUID } from "node:crypto";
+
 import OpenAI from "openai";
-import crypto from "crypto";
+import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { z } from "zod";
+
 import {
-  type MemoryItem,
-  type ConfirmationResult,
-  type SourceAgent,
-  type StoreBundle,
-  toMemoryItem,
-  handleMemoryItem,
-  readEpisodicAndCheckPromotion,
+    type ConfirmationResult,
+    type EpisodicStore,
+    type MemoryItem,
+    type MemoryLogEntry,
+    type RetrievedEpisodicEntry,
+    type SharedMemoryRow,
+    type SharedStore,
+    type SourceAgent,
+    type Stores,
+    handleMemoryItem,
+    readEpisodicAndCheckPromotion,
+    toMemoryItem,
 } from "./memory";
 
-const client = new OpenAI({
-  baseURL: "https://openrouter.ai/api/v1",
-  apiKey: "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",
-});
+const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+const CHAT_MODEL = "openRouter/free";
 
-const MODEL = "meta-llama/llama-3.3-70b-instruct:free";
-
-export interface MemoryLogEntry {
-  id: string;
-  content: string;
-  tier: "working" | "episodic" | "shared" | "held";
-  agent: SourceAgent;
-  persistence: number;
-  scope: number;
-}
+const OBSERVATION_COUNT = 3;
+const EPISODIC_TOP_K = 5;
 
 export interface AgentContext {
-  stores: StoreBundle;
-  confirm: (item: MemoryItem) => Promise<ConfirmationResult>;
-  embed: (text: string) => Promise<number[]>;
-  log: MemoryLogEntry[];
+    stores: Stores;
+    shared: SharedStore;
+    episodic: Record<SourceAgent, EpisodicStore>;
+    confirm: (item: MemoryItem) => Promise<ConfirmationResult>;
+    embed: (text: string) => Promise<number[]>;
+    log: MemoryLogEntry[];
 }
+
+let client: OpenAI | null = null;
+
+function getClient(): OpenAI {
+    if (!client) {
+        client = new OpenAI({
+            apiKey: process.env.OPENROUTER_API_KEY ?? "",
+            baseURL: OPENROUTER_BASE_URL,
+        });
+    }
+    return client;
+}
+
+// ---------------------------------------------------------------------------
+// Prompts (used verbatim)
+// ---------------------------------------------------------------------------
 
 function observationPrompt(agentName: string): string {
-  return `You are a ${agentName} agent. When you produce an observation, respond ONLY with a valid JSON object matching exactly this shape and nothing else, no markdown, no explanation, no wrapper:
-{
-  "content": "<the observation as a plain string, never empty>",
-  "persistence": <float 0.0 to 1.0, how long this stays relevant>,
-  "scope": <float 0.0 to 1.0, how broadly relevant this is to the whole team vs just you>
-}`;
+    return [
+        `You are a ${agentName} agent. When you produce an observation, respond ONLY with a valid JSON object`,
+        "matching exactly this shape and nothing else, no markdown, no explanation, no wrapper:",
+        '{"content": "<plain string, never empty>", "persistence": <float 0 to 1>, "scope": <float 0 to 1>}',
+        "content is a plain string that is never empty.",
+        "persistence is a float from 0 to 1 describing how long this stays relevant.",
+        "scope is a float from 0 to 1 describing how broadly relevant this is to the whole team versus just you.",
+    ].join("\n");
 }
 
-function confirmationPrompt(
-  existingActive: Array<{ id: string; content: string }>,
-  newContent: string
-): string {
-  const list =
-    existingActive.length === 0
-      ? "(none)"
-      : existingActive.map((e) => `- ${e.content} (id: ${e.id})`).join("\n");
-  return `You are reviewing a proposed shared memory entry.
+function confirmationPrompt(activeEntries: SharedMemoryRow[], proposedContent: string): string {
+    const existing =
+        activeEntries.length > 0
+            ? activeEntries.map((entry) => `- ${entry.content} (id: ${entry.id})`).join("\n")
+            : "- None.";
 
-Existing active shared memory:
-${list}
-
-Proposed new entry:
-"${newContent}"
-
-Decide exactly one of:
-- The entry adds durable, team-relevant knowledge not already covered. Respond with confirmed: true and no supersedesId.
-- The entry corrects or replaces an existing entry above. Respond with confirmed: true and supersedesId set to that entry's id.
-- The entry is unreliable, unverifiable, or irrelevant to the team. Respond with confirmed: false.
-
-Respond ONLY with a JSON object matching exactly this shape, no markdown, no explanation:
-{ "confirmed": true or false, "supersedesId": "<id>" or omit }`;
-}
-
-function synthesizerFinalPrompt(
-  task: string,
-  researcherOutput: string,
-  sharedActive: Array<{ content: string }>,
-  episodicForSynth: Array<{ content: string }>
-): string {
-  const sharedList =
-    sharedActive.length === 0
-      ? "(none)"
-      : sharedActive.map((e) => `- ${e.content}`).join("\n");
-  const episodicList =
-    episodicForSynth.length === 0
-      ? "(none)"
-      : episodicForSynth.map((e) => `- ${e.content}`).join("\n");
-  return `You are a Synthesizer agent producing a final answer.
-
-Task: ${task}
-Researcher's findings: ${researcherOutput}
-
-Team shared memory (confirmed):
-${sharedList}
-
-Your prior episodic memory:
-${episodicList}
-
-Write the final answer as plain prose. No preamble, no headings, no markdown, no code fences.`;
+    return [
+        "You are the confirmation agent for shared team memory. Decide whether a proposed entry belongs in shared memory.",
+        "",
+        "Existing shared entries:",
+        existing,
+        "",
+        `Proposed entry: "${proposedContent}"`,
+        "",
+        "Choose one decision:",
+        "1. It adds durable new knowledge: respond confirmed true with no supersedesId.",
+        "2. It corrects or replaces an existing entry: respond confirmed true with supersedesId set to that entry's id.",
+        "3. It is unreliable or irrelevant: respond confirmed false.",
+        "",
+        'Respond with a JSON object only: {"confirmed": true, "supersedesId": "existing entry id"}',
+    ].join("\n");
 }
 
 function researcherSummaryPrompt(task: string, observations: string[]): string {
-  return `Summarize these observations into a 3 to 5 sentence briefing for a downstream synthesizer. Plain prose. No headings, no markdown.
+    const collected = observations.length > 0 ? observations.map((text) => `- ${text}`).join("\n") : "- None.";
 
-Task: ${task}
-Observations:
-${observations.map((o) => `- ${o}`).join("\n")}`;
+    return [
+        "You are a researcher agent. Read the task and the observations you collected.",
+        "",
+        `Task:\n${task}`,
+        "",
+        `Collected observations:\n${collected}`,
+        "",
+        "Write a three to five sentence briefing for a downstream synthesizer.",
+        "Plain prose, no headings, no markdown.",
+    ].join("\n");
 }
+
+function synthesizerFinalPrompt(
+    task: string,
+    researcherOutput: string,
+    activeShared: SharedMemoryRow[],
+    episodicEntries: RetrievedEpisodicEntry[],
+): string {
+    const shared =
+        activeShared.length > 0 ? activeShared.map((entry) => `- ${entry.content}`).join("\n") : "- None.";
+    const episodic =
+        episodicEntries.length > 0 ? episodicEntries.map((entry) => `- ${entry.content}`).join("\n") : "- None.";
+
+    return [
+        "You are a synthesizer agent. Produce the final answer to the task.",
+        "",
+        `Task:\n${task}`,
+        "",
+        `Researcher briefing:\n${researcherOutput}`,
+        "",
+        `Active shared memory:\n${shared}`,
+        "",
+        `Your episodic memory:\n${episodic}`,
+        "",
+        "Write the final answer as plain prose with no preamble, no headings, no markdown, no code fences.",
+    ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Model helpers
+// ---------------------------------------------------------------------------
 
 async function callModel(
-  system: string,
-  user: string,
-  jsonMode: boolean
+    systemPrompt: string,
+    userPrompt: string,
+    extraSystemPrompt?: string,
+    json: boolean = false,
 ): Promise<string> {
-  const res = await client.chat.completions.create({
-    model: MODEL,
-    messages: [
-      { role: "system", content: system },
-      { role: "user", content: user },
-    ],
-    ...(jsonMode ? { response_format: { type: "json_object" as const } } : {}),
-  });
-  return res.choices[0]?.message?.content ?? "";
+    const messages: ChatCompletionMessageParam[] = [{ role: "system", content: systemPrompt }];
+    if (extraSystemPrompt) {
+        messages.push({ role: "system", content: extraSystemPrompt });
+    }
+    messages.push({ role: "user", content: userPrompt });
+
+    const response = await getClient().chat.completions.create({
+        model: CHAT_MODEL,
+        messages,
+        ...(json ? { response_format: { type: "json_object" as const } } : {}),
+    });
+
+    const content = response.choices[0]?.message?.content ?? "";
+    return content.trim();
 }
+
+/** Tolerates fenced or padded JSON, still throws on genuinely malformed output. */
+function parseJsonObject(text: string): unknown {
+    const unfenced = text.replace(/```(?:json)?/gi, "").replace(/```/g, "").trim();
+
+    try {
+        return JSON.parse(unfenced);
+    } catch {
+        // fall through to brace extraction
+    }
+
+    const start = unfenced.indexOf("{");
+    const end = unfenced.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+        return JSON.parse(unfenced.slice(start, end + 1));
+    }
+
+    throw new Error("model response contained no JSON object");
+}
+
+function formatEpisodicContext(entries: RetrievedEpisodicEntry[]): string {
+    if (entries.length === 0) {
+        return "Episodic memory: none yet.";
+    }
+    const lines = entries.map(
+        (entry) =>
+            `- ${entry.content} (retrievalCount: ${entry.retrievalCount}, held: ${entry.heldFromShared ? "yes" : "no"})`,
+    );
+    return ["Episodic memory from previous runs:", ...lines].join("\n");
+}
+
+function pushWorkingLog(ctx: AgentContext, id: string, agent: SourceAgent, content: string): void {
+    ctx.log.push({ id, content, tier: "working", agent, persistence: 0, scope: 0 });
+}
+
+// ---------------------------------------------------------------------------
+// Researcher
+// ---------------------------------------------------------------------------
 
 export async function runResearcher(task: string, ctx: AgentContext): Promise<string> {
-  let episodicContext = "";
-  try {
-    const entries = await readEpisodicAndCheckPromotion(
-      "researcher",
-      ctx.stores,
-      task,
-      5,
-      ctx.confirm,
-      ctx.embed
+    const episodicEntries = await readEpisodicAndCheckPromotion(
+        "researcher",
+        ctx.episodic.researcher,
+        ctx.shared,
+        task,
+        EPISODIC_TOP_K,
+        ctx.confirm,
+        ctx.embed,
     );
-    if (entries.length > 0) {
-      episodicContext =
-        "Your prior episodic memory:\n" +
-        entries.map((e) => `- ${e.content}`).join("\n");
-    }
-  } catch {
-    episodicContext = "";
-  }
+    const episodicContext = formatEpisodicContext(episodicEntries);
 
-  const observations: string[] = [];
-  for (let i = 0; i < 3; i++) {
+    const observations: string[] = [];
+
+    for (let index = 1; index <= OBSERVATION_COUNT; index++) {
+        const id = randomUUID();
+        let rawText = "";
+
+        try {
+            rawText = await callModel(
+                observationPrompt("Researcher"),
+                `Task: ${task}\n\nThis is observation ${index} of ${OBSERVATION_COUNT}. Produce exactly one observation.`,
+                episodicContext,
+                true,
+            );
+
+            const item = toMemoryItem(parseJsonObject(rawText), "researcher", id);
+            const tier = await handleMemoryItem(item, ctx.stores, ctx.confirm, ctx.embed);
+
+            ctx.log.push({
+                id,
+                content: item.content,
+                tier,
+                agent: "researcher",
+                persistence: item.persistence,
+                scope: item.scope,
+            });
+            observations.push(item.content);
+        } catch (error) {
+            console.error("researcher observation failed", error);
+            pushWorkingLog(ctx, id, "researcher", rawText);
+        }
+    }
+
     try {
-      const user = `Task: ${task}\nObservation ${i + 1} of 3.`;
-      const fullUser = episodicContext ? `${episodicContext}\n\n${user}` : user;
-      const raw = await callModel(observationPrompt("Researcher"), fullUser, true);
-      const parsed = JSON.parse(raw);
-      const item = toMemoryItem(parsed, "researcher", crypto.randomUUID());
-      const tier = await handleMemoryItem(item, ctx.stores, ctx.confirm, ctx.embed);
-      ctx.log.push({
-        id: item.id,
-        content: item.content,
-        tier,
-        agent: "researcher",
-        persistence: item.persistence,
-        scope: item.scope,
-      });
-      observations.push(item.content);
-    } catch {
-      ctx.log.push({
-        id: crypto.randomUUID(),
-        content: "(observation failed)",
-        tier: "working",
-        agent: "researcher",
-        persistence: 0,
-        scope: 0,
-      });
+        return await callModel(researcherSummaryPrompt(task, observations), "Write the briefing now.");
+    } catch (error) {
+        console.error("researcher summary failed", error);
+        return observations.join(" ");
     }
-  }
-
-  try {
-    const summary = await callModel(
-      "Respond in plain prose only.",
-      researcherSummaryPrompt(task, observations),
-      false
-    );
-    return summary.trim() || observations.join(" ");
-  } catch {
-    return observations.join(" ");
-  }
 }
 
-export async function runSynthesizer(
-  task: string,
-  researcherOutput: string,
-  ctx: AgentContext
-): Promise<string> {
-  let episodicEntries: Array<{ content: string }> = [];
-  try {
-    episodicEntries = await readEpisodicAndCheckPromotion(
-      "synthesizer",
-      ctx.stores,
-      `${task}\n${researcherOutput}`,
-      5,
-      ctx.confirm,
-      ctx.embed
+// ---------------------------------------------------------------------------
+// Synthesizer
+// ---------------------------------------------------------------------------
+
+export async function runSynthesizer(task: string, researcherOutput: string, ctx: AgentContext): Promise<string> {
+    const episodicEntries = await readEpisodicAndCheckPromotion(
+        "synthesizer",
+        ctx.episodic.synthesizer,
+        ctx.shared,
+        `${task}\n\n${researcherOutput}`,
+        EPISODIC_TOP_K,
+        ctx.confirm,
+        ctx.embed,
     );
-  } catch {
-    episodicEntries = [];
-  }
 
-  const sharedActive = ctx.stores.shared.readActive();
+    const activeShared = ctx.shared.readActive();
 
-  let finalOutput = researcherOutput;
-  try {
-    const raw = await callModel(
-      "You are a Synthesizer agent. Respond in plain prose only, no markdown, no headings.",
-      synthesizerFinalPrompt(task, researcherOutput, sharedActive, episodicEntries),
-      false
-    );
-    finalOutput = raw.trim() || researcherOutput;
-  } catch {
-    finalOutput = researcherOutput;
-  }
+    let finalOutput: string;
+    try {
+        finalOutput = await callModel(
+            synthesizerFinalPrompt(task, researcherOutput, activeShared, episodicEntries),
+            "Write the final answer now.",
+        );
+    } catch (error) {
+        console.error("synthesizer final answer failed", error);
+        finalOutput = researcherOutput;
+    }
+    if (finalOutput.length === 0) {
+        finalOutput = researcherOutput;
+    }
 
-  try {
-    const user = `Task: ${task}\nFinal answer: ${finalOutput}\nProduce one observation about your own synthesis.`;
-    const raw = await callModel(observationPrompt("Synthesizer"), user, true);
-    const parsed = JSON.parse(raw);
-    const item = toMemoryItem(parsed, "synthesizer", crypto.randomUUID());
-    const tier = await handleMemoryItem(item, ctx.stores, ctx.confirm, ctx.embed);
-    ctx.log.push({
-      id: item.id,
-      content: item.content,
-      tier,
-      agent: "synthesizer",
-      persistence: item.persistence,
-      scope: item.scope,
-    });
-  } catch {
-    // silent
-  }
+    const id = randomUUID();
+    try {
+        const rawText = await callModel(
+            observationPrompt("Synthesizer"),
+            `Task: ${task}\n\nYour final answer:\n${finalOutput}\n\nProduce exactly one observation about your own synthesis.`,
+            formatEpisodicContext(episodicEntries),
+            true,
+        );
 
-  return finalOutput;
+        const item = toMemoryItem(parseJsonObject(rawText), "synthesizer", id);
+        const tier = await handleMemoryItem(item, ctx.stores, ctx.confirm, ctx.embed);
+
+        ctx.log.push({
+            id,
+            content: item.content,
+            tier,
+            agent: "synthesizer",
+            persistence: item.persistence,
+            scope: item.scope,
+        });
+    } catch (error) {
+        console.error("synthesizer observation failed", error);
+        pushWorkingLog(ctx, id, "synthesizer", "");
+    }
+
+    return finalOutput;
 }
+
+// ---------------------------------------------------------------------------
+// Confirmation gate
+// ---------------------------------------------------------------------------
 
 const ConfirmationSchema = z.object({
-  confirmed: z.boolean(),
-  supersedesId: z.string().optional(),
+    confirmed: z.boolean(),
+    supersedesId: z.string().optional(),
 });
 
-export function buildConfirm(
-  shared: StoreBundle["shared"]
-): (item: MemoryItem) => Promise<ConfirmationResult> {
-  return async (item: MemoryItem) => {
+export async function confirmWithOtherAgent(item: MemoryItem, shared: SharedStore): Promise<ConfirmationResult> {
     try {
-      const active = shared.readActive();
-      const prompt = confirmationPrompt(active, item.content);
-      const raw = await callModel(prompt, "Respond with JSON only.", true);
-      const parsed = JSON.parse(raw);
-      const validated = ConfirmationSchema.safeParse(parsed);
-      if (!validated.success) return { confirmed: false };
-      return {
-        confirmed: validated.data.confirmed,
-        supersedesId: validated.data.supersedesId,
-      };
-    } catch {
-      return { confirmed: false };
+        const activeEntries = shared.readActive();
+        const rawText = await callModel(
+            confirmationPrompt(activeEntries, item.content),
+            "Respond with the JSON object only.",
+            undefined,
+            true,
+        );
+
+        const candidate = parseJsonObject(rawText);
+        if (candidate && typeof candidate === "object" && (candidate as Record<string, unknown>).supersedesId === null) {
+            delete (candidate as Record<string, unknown>).supersedesId;
+        }
+
+        const parsed = ConfirmationSchema.safeParse(candidate);
+        if (!parsed.success) {
+            return { confirmed: false };
+        }
+        return { confirmed: parsed.data.confirmed, supersedesId: parsed.data.supersedesId };
+    } catch (error) {
+        console.error("shared memory confirmation failed", error);
+        return { confirmed: false };
     }
-  };
 }
