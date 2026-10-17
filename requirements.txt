@@ -1,10 +1,1 @@
-fastApi
-gunicorn
-uvicorn[standard]
 yt-dlp[default]
-opencv-python-headless
-pillow
-numpy
-pydantic
-jinja2
-python-multipart
