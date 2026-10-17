@@ -1,126 +1,102 @@
-import { StateGraph, Annotation, START, END } from "@langchain/langgraph";
-import {
-  getStores,
-  embed,
-  type SourceAgent,
-} from "./memory";
-import {
-  runResearcher,
-  runSynthesizer,
-  buildConfirm,
-  type AgentContext,
-  type MemoryLogEntry,
-} from "./agents";
+// Per-request LangGraph wiring: researcher -> synthesizer.
+// Everything request-scoped (stores handle, confirmation closure, log buffer)
+// lives in this function so concurrent Railway requests never share state.
 
-export interface ApiResponse {
-  finalOutput: string;
-  memoryLog: MemoryLogEntry[];
-  sharedMemory: Array<{
+import { Annotation, END, START, StateGraph } from "@langchain/langgraph";
+
+import { type AgentContext, confirmWithOtherAgent, runResearcher, runSynthesizer } from "./agents";
+import {
+    type EpisodicSummary,
+    type MemoryLogEntry,
+    type SharedMemoryRecord,
+    embed,
+    getStores,
+    resolveDataDir,
+} from "./memory";
+
+export interface SharedMemoryView {
     id: string;
     content: string;
     active: boolean;
-    sourceAgent: SourceAgent;
+    sourceAgent: string;
     supersedes: string | null;
     supersededBy: string | null;
     promotedFrom: string | null;
     createdAt: string;
-  }>;
-  episodicMemory: {
-    researcher: Array<{
-      id: string;
-      content: string;
-      retrievalCount: number;
-      kappa: number;
-      heldFromShared: boolean;
-    }>;
-    synthesizer: Array<{
-      id: string;
-      content: string;
-      retrievalCount: number;
-      kappa: number;
-      heldFromShared: boolean;
-    }>;
-  };
 }
 
-const PipelineState = Annotation.Root({
-  task: Annotation<string>(),
-  researcherOutput: Annotation<string>({
-    reducer: (_prev, next) => next,
-    default: () => "",
-  }),
-  finalOutput: Annotation<string>({
-    reducer: (_prev, next) => next,
-    default: () => "",
-  }),
+export interface EpisodicMemoryView {
+    researcher: EpisodicSummary[];
+    synthesizer: EpisodicSummary[];
+}
+
+export interface PipelineResult {
+    finalOutput: string;
+    memoryLog: MemoryLogEntry[];
+    sharedMemory: SharedMemoryView[];
+    episodicMemory: EpisodicMemoryView;
+}
+
+const MemoryState = Annotation.Root({
+    task: Annotation<string>,
+    researcherOutput: Annotation<string>,
+    finalOutput: Annotation<string>,
+    memoryLog: Annotation<MemoryLogEntry[]>({
+        reducer: (_previous, next) => next,
+        default: () => [],
+    }),
 });
 
-export async function runPipeline(task: string): Promise<ApiResponse> {
-  const stores = await getStores();
-  const log: MemoryLogEntry[] = [];
+function toSharedView(row: SharedMemoryRecord): SharedMemoryView {
+    return {
+        id: row.id,
+        content: row.content,
+        active: row.isActive === 1,
+        sourceAgent: row.sourceAgent,
+        supersedes: row.supersedes ?? null,
+        supersededBy: row.supersededBy ?? null,
+        promotedFrom: row.promotedFrom ?? null,
+        createdAt: row.createdAt,
+    };
+}
 
-  const ctx: AgentContext = {
-    stores,
-    confirm: buildConfirm(stores.shared),
-    embed,
-    log,
-  };
+export async function runPipeline(task: string): Promise<PipelineResult> {
+    // Resolve (and create) the memory root before anything else touches disk.
+    resolveDataDir();
+    const stores = await getStores();
 
-  const graph = new StateGraph(PipelineState)
-    .addNode("researcher", async (state: { task: string }) => {
-      const out = await runResearcher(state.task, ctx);
-      return { researcherOutput: out };
-    })
-    .addNode("synthesizer", async (state: { task: string; researcherOutput: string }) => {
-      const out = await runSynthesizer(state.task, state.researcherOutput, ctx);
-      return { finalOutput: out };
-    })
-    .addEdge(START, "researcher")
-    .addEdge("researcher", "synthesizer")
-    .addEdge("synthesizer", END)
-    .compile();
+    const ctx: AgentContext = {
+        stores,
+        shared: stores.shared,
+        episodic: stores.episodic,
+        confirm: (item) => confirmWithOtherAgent(item, stores.shared),
+        embed,
+        log: [],
+    };
 
-  const result = await graph.invoke({ task });
+    const graph = new StateGraph(MemoryState)
+        .addNode("researcher", async (state) => {
+            const researcherOutput = await runResearcher(state.task, ctx);
+            return { researcherOutput, memoryLog: [...ctx.log] };
+        })
+        .addNode("synthesizer", async (state) => {
+            const finalOutput = await runSynthesizer(state.task, state.researcherOutput, ctx);
+            return { finalOutput, memoryLog: [...ctx.log] };
+        })
+        .addEdge(START, "researcher")
+        .addEdge("researcher", "synthesizer")
+        .addEdge("synthesizer", END)
+        .compile();
 
-  const sharedRows = stores.shared.readAll();
-  const sharedMemory = sharedRows.map((r) => ({
-    id: r.id,
-    content: r.content,
-    active: r.isActive === 1,
-    sourceAgent: r.sourceAgent,
-    supersedes: r.supersedes ?? null,
-    supersededBy: r.supersededBy ?? null,
-    promotedFrom: r.promotedFrom ?? null,
-    createdAt: r.createdAt,
-  }));
+    const result = await graph.invoke({ task });
 
-  const researcherEpisodic = (await stores.episodic.researcher.readAllWithCounts()).map(
-    (e) => ({
-      id: e.id,
-      content: e.content,
-      retrievalCount: e.retrievalCount,
-      kappa: e.kappa,
-      heldFromShared: e.heldFromShared === true,
-    })
-  );
-
-  const synthesizerEpisodic = (await stores.episodic.synthesizer.readAllWithCounts()).map(
-    (e) => ({
-      id: e.id,
-      content: e.content,
-      retrievalCount: e.retrievalCount,
-      kappa: e.kappa,
-      heldFromShared: e.heldFromShared === true,
-    })
-  );
-
-  return {
-    finalOutput: (result as { finalOutput?: string }).finalOutput ?? "",
-    memoryLog: log,
-    sharedMemory,
-    episodicMemory: {
-      researcher: researcherEpisodic,
-      synthesizer: synthesizerEpisodic,
-    },
-  };
+    return {
+        finalOutput: result.finalOutput ?? "",
+        memoryLog: [...ctx.log],
+        sharedMemory: stores.shared.readAll().map(toSharedView),
+        episodicMemory: {
+            researcher: await stores.episodic.researcher.readAllWithCounts(),
+            synthesizer: await stores.episodic.synthesizer.readAllWithCounts(),
+        },
+    };
 }
