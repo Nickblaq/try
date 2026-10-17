@@ -1,18 +1,27 @@
-import { runPipeline } from "@/lib/pipeline";
+import { runPipeline } from "../../../lib/pipeline";
 
 export const runtime = "nodejs";
 
-export async function POST(req: Request): Promise<Response> {
-  try {
-    const body = await req.json();
-    const task = body?.task;
-    if (typeof task !== "string" || task.trim().length === 0) {
-      return Response.json({ error: "task is required" }, { status: 400 });
+export async function POST(request: Request): Promise<Response> {
+    let body: unknown;
+    try {
+        body = await request.json();
+    } catch {
+        body = undefined;
     }
-    const result = await runPipeline(task);
-    return Response.json(result);
-  } catch (err) {
-    console.error("memory route error", err);
-    return Response.json({ error: "pipeline failed" }, { status: 500 });
-  }
+
+    const task =
+        body && typeof body === "object" ? (body as Record<string, unknown>).task : undefined;
+
+    if (typeof task !== "string") {
+        return Response.json({ error: "task is required" }, { status: 400 });
+    }
+
+    try {
+        const result = await runPipeline(task);
+        return Response.json(result);
+    } catch (error) {
+        console.error("memory pipeline failed", error);
+        return Response.json({ error: "pipeline failed" }, { status: 500 });
+    }
 }

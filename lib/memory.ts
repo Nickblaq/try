@@ -1,5 +1,14 @@
-import { z } from "zod";
-import { LocalIndex } from "vectra";
+// Hierarchical memory for the two-agent pipeline.
+// working  -> never persisted
+// episodic -> per-agent local vector index (vectra)
+// shared   -> sqlite table, gated by the other agent's confirmation
+// held     -> kept in the agent's episodic index, flagged as heldFromShared
+
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { promises as fsp } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 import Database from "better-sqlite3";
 import OpenAI from "openai";
 import path from "path";
@@ -10,7 +19,9 @@ const client = new OpenAI({
   apiKey: "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",
 });
 
-const MODEL = "meta-llama/llama-3.3-70b-instruct:free";
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
 export const THETA_P = 0.4;
 export const THETA_S = 0.55;
@@ -18,454 +29,728 @@ export const W1 = 0.6;
 export const W2 = 0.4;
 export const KAPPA = 5;
 
+const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+const EMBEDDING_MODEL = "meta-llama/llama-3.3-70b-instruct:free";
+const TFIDF_DIMENSIONS = 256;
+const EMBEDDING_MODE_FILE = "embedding.json";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
 export const ScoredItemSchema = z.object({
-  content: z.string().min(1),
-  persistence: z.number().min(0).max(1),
-  scope: z.number().min(0).max(1),
+    content: z.string().min(1),
+    persistence: z.number().min(0).max(1),
+    scope: z.number().min(0).max(1),
 });
 
 export type ScoredItem = z.infer<typeof ScoredItemSchema>;
+
 export type MemoryTier = "working" | "episodic" | "shared" | "held";
+
 export type SourceAgent = "researcher" | "synthesizer";
 
 export interface MemoryItem {
-  id: string;
-  content: string;
-  persistence: number;
-  scope: number;
-  sourceAgent: SourceAgent;
+    id: string;
+    content: string;
+    persistence: number;
+    scope: number;
+    sourceAgent: SourceAgent;
 }
 
 export interface ConfirmationResult {
-  confirmed: boolean;
-  supersedesId?: string;
+    confirmed: boolean;
+    supersedesId?: string;
 }
 
-export interface RoutingConfig {
-  w1: number;
-  w2: number;
-  thetaP: number;
-  thetaS: number;
+export interface RouteResult {
+    tier: MemoryTier;
+    supersedesId?: string;
 }
 
-export const DEFAULT_CONFIG: RoutingConfig = {
-  w1: W1,
-  w2: W2,
-  thetaP: THETA_P,
-  thetaS: THETA_S,
+export interface MemoryLogEntry {
+    id: string;
+    content: string;
+    tier: MemoryTier;
+    agent: SourceAgent;
+    persistence: number;
+    scope: number;
+}
+
+export type ConfirmFn = (item: MemoryItem) => Promise<ConfirmationResult>;
+
+export type EmbedFn = (text: string) => Promise<number[]>;
+
+export type EpisodicMetadata = {
+    content: string;
+    sourceAgent: string;
+    heldFromShared: boolean;
+    persistence: number;
+    scope: number;
+    createdAt: string;
 };
 
-export function computeR(item: MemoryItem, config: RoutingConfig = DEFAULT_CONFIG): number {
-  return config.w1 * item.persistence + config.w2 * item.scope;
+export interface EpisodicEntry {
+    id: string;
+    content: string;
+    sourceAgent: SourceAgent;
+    heldFromShared: boolean;
+    persistence: number;
+    scope: number;
 }
 
-export function validateScoredItem(raw: unknown): ScoredItem | null {
-  const result = ScoredItemSchema.safeParse(raw);
-  return result.success ? result.data : null;
+export interface RetrievedEpisodicEntry extends EpisodicEntry {
+    retrievalCount: number;
+    kappa: number;
 }
 
+export interface EpisodicSummary {
+    id: string;
+    content: string;
+    retrievalCount: number;
+    kappa: number;
+    heldFromShared: boolean;
+}
+
+export interface SharedMemoryRow {
+    id: string;
+    content: string;
+    sourceAgent: SourceAgent;
+    confirmedBy: SourceAgent;
+    createdAt: string;
+    isActive: number;
+    supersedes: string | null;
+    promotedFrom: string | null;
+}
+
+export interface SharedMemoryRecord extends SharedMemoryRow {
+    supersededBy: string | null;
+}
+
+export interface Stores {
+    shared: SharedStore;
+    episodic: Record<SourceAgent, EpisodicStore>;
+}
+
+// ---------------------------------------------------------------------------
+// Scoring and routing
+// ---------------------------------------------------------------------------
+
+/**
+ * R = W1 * persistence + W2 * scope.
+ * Exported for logging only: routing never branches on R.
+ */
+export function computeR(item: Pick<MemoryItem, "persistence" | "scope">): number {
+    return W1 * item.persistence + W2 * item.scope;
+}
+
+export function otherAgent(agent: SourceAgent): SourceAgent {
+    return agent === "researcher" ? "synthesizer" : "researcher";
+}
+
+/**
+ * persistence < THETA_P          -> working
+ * scope < THETA_S                -> episodic
+ * otherwise ask the other agent  -> shared (maybe superseding) or held
+ */
+export async function routeItem(item: MemoryItem, confirm: ConfirmFn): Promise<RouteResult> {
+    if (item.persistence < THETA_P) {
+        return { tier: "working" };
+    }
+    if (item.scope < THETA_S) {
+        return { tier: "episodic" };
+    }
+
+    const confirmation = await confirm(item);
+    if (confirmation.confirmed) {
+        return { tier: "shared", supersedesId: confirmation.supersedesId };
+    }
+    return { tier: "held" };
+}
+
+function extractContent(raw: unknown): string {
+    if (typeof raw === "string") {
+        return raw;
+    }
+    if (raw && typeof raw === "object") {
+        const content = (raw as Record<string, unknown>).content;
+        if (typeof content === "string") {
+            return content;
+        }
+    }
+    return "";
+}
+
+/**
+ * Never throws. Anything that does not validate becomes a zero-score item,
+ * which routes to working memory by design.
+ */
 export function toMemoryItem(raw: unknown, sourceAgent: SourceAgent, id: string): MemoryItem {
-  const validated = validateScoredItem(raw);
-  if (!validated) {
-    const content =
-      typeof raw === "object" && raw !== null && "content" in raw
-        ? String((raw as { content: unknown }).content)
-        : "";
-    return { id, content, persistence: 0, scope: 0, sourceAgent };
-  }
-  return { id, ...validated, sourceAgent };
+    const parsed = ScoredItemSchema.safeParse(raw);
+    if (parsed.success) {
+        return {
+            id,
+            sourceAgent,
+            content: parsed.data.content,
+            persistence: parsed.data.persistence,
+            scope: parsed.data.scope,
+        };
+    }
+    return {
+        id,
+        sourceAgent,
+        content: extractContent(raw),
+        persistence: 0,
+        scope: 0,
+    };
 }
 
-export async function routeItem(
-  item: MemoryItem,
-  confirmWithOtherAgent: (item: MemoryItem) => Promise<ConfirmationResult>
-): Promise<{ tier: MemoryTier; supersedesId?: string }> {
-  if (item.persistence < THETA_P) return { tier: "working" };
-  if (item.scope < THETA_S) return { tier: "episodic" };
-  const result = await confirmWithOtherAgent(item);
-  return result.confirmed
-    ? { tier: "shared", supersedesId: result.supersedesId }
-    : { tier: "held" };
-}
+// ---------------------------------------------------------------------------
+// Data directory
+// ---------------------------------------------------------------------------
 
 let cachedDataDir: string | null = null;
 
-export function resolveDataDir(): string {
-  if (cachedDataDir) return cachedDataDir;
-  const primary = path.join(process.cwd(), "data");
-  try {
-    fs.mkdirSync(primary, { recursive: true });
-    fs.accessSync(primary, fs.constants.W_OK);
-    cachedDataDir = primary;
-    return primary;
-  } catch {
-    const fallback = path.join("/tmp", "data");
-    fs.mkdirSync(fallback, { recursive: true });
-    cachedDataDir = fallback;
-    return fallback;
-  }
+function isWritableDir(dir: string): boolean {
+    const probe = path.join(dir, `.write-probe-${process.pid}-${Date.now()}`);
+    try {
+        writeFileSync(probe, "ok", "utf8");
+        unlinkSync(probe);
+        return true;
+    } catch {
+        return false;
+    }
 }
+
+/**
+ * Prefer <project root>/data, fall back to <tmp>/data. Cached for the process.
+ */
+export function resolveDataDir(): string {
+    if (cachedDataDir) {
+        return cachedDataDir;
+    }
+
+    const projectData = path.join(process.cwd(), "data");
+    try {
+        mkdirSync(projectData, { recursive: true });
+        if (isWritableDir(projectData)) {
+            cachedDataDir = projectData;
+            return cachedDataDir;
+        }
+    } catch {
+        // fall through to tmp
+    }
+
+    const tmpData = path.join(os.tmpdir(), "data");
+    try {
+        mkdirSync(tmpData, { recursive: true });
+    } catch {
+        // nothing else to try
+    }
+    cachedDataDir = tmpData;
+    return cachedDataDir;
+}
+
+// ---------------------------------------------------------------------------
+// Embeddings: one mode per deployment, persisted, never mixed
+// ---------------------------------------------------------------------------
 
 interface EmbeddingMode {
-  mode: "openai" | "tfidf";
-  dim: number;
+    mode: "openai" | "tfidf";
+    dimensions: number;
 }
 
-let cachedEmbeddingMode: EmbeddingMode | null = null;
+let embeddingModePromise: Promise<EmbeddingMode> | null = null;
+let openaiClient: OpenAI | null = null;
+
+function getEmbeddingClient(): OpenAI {
+    if (!openaiClient) {
+        openaiClient = new OpenAI({
+            apiKey: process.env.OPENROUTER_API_KEY ?? "",
+            baseURL: OPENROUTER_BASE_URL,
+        });
+    }
+    return openaiClient;
+}
 
 function embeddingModePath(): string {
-  return path.join(resolveDataDir(), "embedding-mode.json");
+    return path.join(resolveDataDir(), EMBEDDING_MODE_FILE);
 }
 
-function loadEmbeddingMode(): EmbeddingMode | null {
-  try {
-    const raw = fs.readFileSync(embeddingModePath(), "utf-8");
-    const parsed = JSON.parse(raw) as EmbeddingMode;
-    if ((parsed.mode === "openai" || parsed.mode === "tfidf") && typeof parsed.dim === "number") {
-      return parsed;
+function readPersistedEmbeddingMode(): EmbeddingMode | null {
+    try {
+        const file = embeddingModePath();
+        if (!existsSync(file)) {
+            return null;
+        }
+        const parsed = JSON.parse(readFileSync(file, "utf8")) as Partial<EmbeddingMode>;
+        if ((parsed.mode === "openai" || parsed.mode === "tfidf") && Number.isInteger(parsed.dimensions)) {
+            return { mode: parsed.mode, dimensions: parsed.dimensions as number };
+        }
+    } catch {
+        // corrupt or unreadable -> treat as missing
     }
     return null;
-  } catch {
-    return null;
-  }
 }
 
-function saveEmbeddingMode(m: EmbeddingMode): void {
-  try {
-    fs.writeFileSync(embeddingModePath(), JSON.stringify(m), "utf-8");
-  } catch {
-    // ignore
-  }
-}
-
-function fnv1a(str: string): number {
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < str.length; i++) {
-    hash ^= str.charCodeAt(i);
-    hash = (hash * 0x01000193) >>> 0;
-  }
-  return hash >>> 0;
-}
-
-export function tfidfVector(text: string, dim = 256): number[] {
-  const vector = new Array<number>(dim).fill(0);
-  const tokens = text
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter((t) => t.length >= 3);
-  if (tokens.length === 0) return vector;
-  const counts = new Map<number, number>();
-  for (const token of tokens) {
-    const bucket = fnv1a(token) % dim;
-    counts.set(bucket, (counts.get(bucket) ?? 0) + 1);
-  }
-  for (const [bucket, count] of counts) {
-    vector[bucket] = count / (count + 1.5);
-  }
-  let norm = 0;
-  for (let i = 0; i < dim; i++) norm += vector[i] * vector[i];
-  norm = Math.sqrt(norm);
-  if (norm > 0) {
-    for (let i = 0; i < dim; i++) vector[i] /= norm;
-  }
-  return vector;
-}
-
-async function initializeEmbeddingMode(): Promise<EmbeddingMode> {
-  const persisted = loadEmbeddingMode();
-  if (persisted) return persisted;
-  try {
-    const res = await client.embeddings.create({
-      model: "text-embedding-3-small",
-      input: "probe",
-    });
-    const dim = res.data[0]?.embedding?.length ?? 0;
-    if (dim > 0) {
-      const mode: EmbeddingMode = { mode: "openai", dim };
-      saveEmbeddingMode(mode);
-      return mode;
+function persistEmbeddingMode(mode: EmbeddingMode): void {
+    try {
+        writeFileSync(embeddingModePath(), JSON.stringify(mode, null, 2), "utf8");
+    } catch {
+        // The in-process cache still keeps dimensions consistent for this lifetime.
     }
-    throw new Error("empty embedding");
-  } catch {
-    const mode: EmbeddingMode = { mode: "tfidf", dim: 256 };
-    saveEmbeddingMode(mode);
-    return mode;
-  }
+}
+
+async function probeEmbeddingMode(): Promise<EmbeddingMode> {
+    const persisted = readPersistedEmbeddingMode();
+    if (persisted) {
+        return persisted;
+    }
+
+    try {
+        const response = await getEmbeddingClient().embeddings.create({
+            model: EMBEDDING_MODEL,
+            input: "cufx hierarchical memory probe",
+        });
+        const vector = response.data[0]?.embedding;
+        if (!Array.isArray(vector) || vector.length === 0) {
+            throw new Error("embedding probe returned no vector");
+        }
+        const mode: EmbeddingMode = { mode: "openai", dimensions: vector.length };
+        persistEmbeddingMode(mode);
+        return mode;
+    } catch {
+        const mode: EmbeddingMode = { mode: "tfidf", dimensions: TFIDF_DIMENSIONS };
+        persistEmbeddingMode(mode);
+        return mode;
+    }
+}
+
+function getEmbeddingMode(): Promise<EmbeddingMode> {
+    if (!embeddingModePromise) {
+        // Checked once per deployment (first use), then cached for the process.
+        embeddingModePromise = probeEmbeddingMode();
+    }
+    return embeddingModePromise;
+}
+
+const FNV_OFFSET_BASIS = 0x811c9dc5;
+const FNV_PRIME = 0x01000193;
+
+function fnv1a(token: string): number {
+    let hash = FNV_OFFSET_BASIS;
+    for (let i = 0; i < token.length; i++) {
+        hash ^= token.charCodeAt(i);
+        hash = Math.imul(hash, FNV_PRIME) >>> 0;
+    }
+    return hash >>> 0;
+}
+
+/**
+ * Deterministic 256-dimension TF-IDF-style embedding.
+ * Lowercase, split on non-word chars, drop short tokens, FNV-1a into buckets,
+ * accumulate count / (count + 1.5) per token, then L2 normalize.
+ */
+export function tfidfEmbed(text: string, dimensions: number = TFIDF_DIMENSIONS): number[] {
+    const vector = new Array<number>(dimensions).fill(0);
+    const tokens = text
+        .toLowerCase()
+        .split(/\W+/)
+        .filter((token) => token.length >= 3);
+
+    if (tokens.length === 0) {
+        return vector;
+    }
+
+    const counts = new Map<string, number>();
+    for (const token of tokens) {
+        counts.set(token, (counts.get(token) ?? 0) + 1);
+    }
+
+    for (const [token, count] of counts) {
+        const bucket = fnv1a(token) % dimensions;
+        vector[bucket] += count / (count + 1.5);
+    }
+
+    let sumSquares = 0;
+    for (const value of vector) {
+        sumSquares += value * value;
+    }
+    if (sumSquares === 0) {
+        return vector;
+    }
+    const norm = Math.sqrt(sumSquares);
+    return vector.map((value) => value / norm);
 }
 
 export async function embed(text: string): Promise<number[]> {
-  if (!cachedEmbeddingMode) {
-    cachedEmbeddingMode = await initializeEmbeddingMode();
-  }
-  if (cachedEmbeddingMode.mode === "openai") {
-    const res = await client.embeddings.create({
-      model: "text-embedding-3-small",
-      input: text,
+    const mode = await getEmbeddingMode();
+
+    if (mode.mode === "tfidf") {
+        return tfidfEmbed(text, mode.dimensions);
+    }
+
+    // OpenAI mode is sticky: a later failure throws instead of silently
+    // switching modes and corrupting the vector index with other dimensions.
+    const response = await getEmbeddingClient().embeddings.create({
+        model: EMBEDDING_MODEL,
+        input: text,
     });
-    return res.data[0].embedding;
-  }
-  return tfidfVector(text, cachedEmbeddingMode.dim);
+    const vector = response.data[0]?.embedding;
+    if (!Array.isArray(vector) || vector.length !== mode.dimensions) {
+        throw new Error(
+            `embedding dimension mismatch: expected ${mode.dimensions}, got ${vector?.length ?? 0}`,
+        );
+    }
+    return vector;
 }
 
-export interface EpisodicMetadata {
-  id: string;
-  content: string;
-  sourceAgent: SourceAgent;
-  heldFromShared?: boolean;
-}
-
-function asEpisodic(meta: unknown): EpisodicMetadata {
-  const m = (typeof meta === "object" && meta !== null ? meta : {}) as Record<string, unknown>;
-  const sourceAgent: SourceAgent = m.sourceAgent === "synthesizer" ? "synthesizer" : "researcher";
-  return {
-    id: typeof m.id === "string" ? m.id : String(m.id ?? ""),
-    content: typeof m.content === "string" ? m.content : String(m.content ?? ""),
-    sourceAgent,
-    heldFromShared: m.heldFromShared === true,
-  };
-}
+// ---------------------------------------------------------------------------
+// Episodic store (one vectra index per agent)
+// ---------------------------------------------------------------------------
 
 export class EpisodicStore {
-  private index: LocalIndex;
-  private countsPath: string;
-  private counts: Record<string, number> = {};
+    readonly agent: SourceAgent;
+    readonly dataDir: string;
+    private readonly index: LocalIndex<EpisodicMetadata>;
+    private readonly countsFile: string;
+    private queue: Promise<unknown> = Promise.resolve();
 
-  constructor(agentName: SourceAgent, dataDir: string) {
-    const dir = path.join(dataDir, "episodic", agentName);
-    this.index = new LocalIndex(dir);
-    this.countsPath = path.join(dir, "counts.json");
-  }
-
-  async init(): Promise<void> {
-    if (!(await this.index.isIndexCreated())) {
-      await this.index.createIndex();
+    constructor(dataDir: string, agent: SourceAgent) {
+        this.agent = agent;
+        this.dataDir = dataDir;
+        this.index = new LocalIndex<EpisodicMetadata>(path.join(dataDir, "episodic", agent));
+        this.countsFile = path.join(dataDir, "episodic", agent, "counts.json");
     }
-    try {
-      const raw = fs.readFileSync(this.countsPath, "utf-8");
-      this.counts = JSON.parse(raw) as Record<string, number>;
-    } catch {
-      this.counts = {};
+
+    private enqueue<T>(task: () => Promise<T>): Promise<T> {
+        const run = this.queue.then(task, task);
+        this.queue = run.then(
+            () => undefined,
+            () => undefined,
+        );
+        return run;
     }
-  }
 
-  async write(item: MemoryItem, vector: number[], heldFromShared = false): Promise<void> {
-    await this.index.insertItem({
-      vector,
-      metadata: {
-        id: item.id,
-        content: item.content,
-        sourceAgent: item.sourceAgent,
-        heldFromShared,
-      },
-    });
-  }
-
-  async read(queryVector: number[], topK: number): Promise<EpisodicMetadata[]> {
-    const results = await this.index.queryItems(queryVector, "", topK);
-    return results.map((r) => asEpisodic(r.item.metadata));
-  }
-
-  async delete(id: string): Promise<void> {
-    const items = await this.index.listItems();
-    const found = items.find((i) => asEpisodic(i.metadata).id === id);
-    if (found) {
-      await this.index.deleteItem(found.id);
+    async init(): Promise<void> {
+        await fsp.mkdir(path.dirname(this.countsFile), { recursive: true });
+        if (!(await this.index.isIndexCreated())) {
+            await this.index.createIndex({ version: 1 });
+        }
+        await this.ensureCountsFile();
     }
-    if (id in this.counts) {
-      delete this.counts[id];
-      this.persistCounts();
+
+    private async ensureCountsFile(): Promise<void> {
+        if (!existsSync(this.countsFile)) {
+            await fsp.writeFile(this.countsFile, "{}", "utf8");
+        }
     }
-  }
 
-  bumpRetrievalCount(id: string): number {
-    const next = (this.counts[id] ?? 0) + 1;
-    this.counts[id] = next;
-    this.persistCounts();
-    return next;
-  }
-
-  private persistCounts(): void {
-    try {
-      fs.writeFileSync(this.countsPath, JSON.stringify(this.counts), "utf-8");
-    } catch {
-      // ignore
+    private async readCounts(): Promise<Record<string, number>> {
+        try {
+            const raw = await fsp.readFile(this.countsFile, "utf8");
+            const parsed = JSON.parse(raw) as Record<string, unknown>;
+            const counts: Record<string, number> = {};
+            for (const [id, value] of Object.entries(parsed)) {
+                if (typeof value === "number" && Number.isFinite(value)) {
+                    counts[id] = value;
+                }
+            }
+            return counts;
+        } catch {
+            return {};
+        }
     }
-  }
 
-  async readAllWithCounts(): Promise<
-    Array<EpisodicMetadata & { retrievalCount: number; kappa: number }>
-  > {
-    const items = await this.index.listItems();
-    return items.map((i) => {
-      const meta = asEpisodic(i.metadata);
-      return {
-        ...meta,
-        retrievalCount: this.counts[meta.id] ?? 0,
-        kappa: KAPPA,
-      };
-    });
-  }
+    async write(item: MemoryItem, vector: number[], heldFromShared = false): Promise<void> {
+        await this.enqueue(async () => {
+            await fsp.mkdir(path.dirname(this.countsFile), { recursive: true });
+            if (!(await this.index.isIndexCreated())) {
+                await this.index.createIndex({ version: 1 });
+            }
+            await this.index.beginUpdate();
+            try {
+                await this.index.upsertItem({
+                    id: item.id,
+                    vector,
+                    metadata: {
+                        content: item.content,
+                        sourceAgent: item.sourceAgent,
+                        heldFromShared,
+                        persistence: item.persistence,
+                        scope: item.scope,
+                        createdAt: new Date().toISOString(),
+                    },
+                });
+            } finally {
+                await this.index.endUpdate();
+            }
+        });
+    }
+
+    async read(queryVector: number[], topK: number): Promise<EpisodicEntry[]> {
+        if (!(await this.index.isIndexCreated())) {
+            return [];
+        }
+        const results = await this.index.queryItems(queryVector, "", Math.max(1, topK));
+        return results.map((result) => ({
+            id: result.item.id,
+            content: String(result.item.metadata.content ?? ""),
+            sourceAgent: this.agent,
+            heldFromShared: Boolean(result.item.metadata.heldFromShared),
+            persistence: Number(result.item.metadata.persistence ?? 0),
+            scope: Number(result.item.metadata.scope ?? 0),
+        }));
+    }
+
+    async delete(id: string): Promise<void> {
+        await this.enqueue(async () => {
+            if (!(await this.index.isIndexCreated())) {
+                return;
+            }
+            await this.index.beginUpdate();
+            try {
+                await this.index.deleteItem(id);
+            } finally {
+                await this.index.endUpdate();
+            }
+        });
+    }
+
+    async bumpRetrievalCount(id: string): Promise<number> {
+        return this.enqueue(async () => {
+            await this.ensureCountsFile();
+            const counts = await this.readCounts();
+            const next = (counts[id] ?? 0) + 1;
+            counts[id] = next;
+            await fsp.writeFile(this.countsFile, JSON.stringify(counts, null, 2), "utf8");
+            return next;
+        });
+    }
+
+    /**
+     * Every entry in this index, merged with its retrieval counts.
+     */
+    async readAllWithCounts(): Promise<EpisodicSummary[]> {
+        if (!(await this.index.isIndexCreated())) {
+            return [];
+        }
+        const [items, counts] = await Promise.all([
+            this.index.listItems<EpisodicMetadata>(),
+            this.readCounts(),
+        ]);
+        return items.map((item) => ({
+            id: item.id,
+            content: String(item.metadata.content ?? ""),
+            retrievalCount: counts[item.id] ?? 0,
+            kappa: KAPPA,
+            heldFromShared: Boolean(item.metadata.heldFromShared),
+        }));
+    }
 }
 
-export interface SharedRow {
-  id: string;
-  content: string;
-  sourceAgent: SourceAgent;
-  confirmedBy: SourceAgent;
-  createdAt: string;
-  isActive: number;
-  supersedes: string | null;
-  promotedFrom: string | null;
-}
+// ---------------------------------------------------------------------------
+// Shared store (sqlite)
+// ---------------------------------------------------------------------------
 
 export class SharedStore {
-  private db: Database.Database;
+    readonly db: Database.Database;
 
-  constructor(dbPath: string) {
-    this.db = new Database(dbPath);
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS shared_memory (
-        id TEXT PRIMARY KEY,
-        content TEXT NOT NULL,
-        sourceAgent TEXT NOT NULL,
-        confirmedBy TEXT NOT NULL,
-        createdAt TEXT NOT NULL,
-        isActive INTEGER NOT NULL DEFAULT 1,
-        supersedes TEXT,
-        promotedFrom TEXT
-      );
-    `);
-  }
-
-  write(
-    item: MemoryItem,
-    confirmedBy: SourceAgent,
-    supersedesId: string | null = null,
-    promotedFrom: string | null = null
-  ): void {
-    const insert = this.db.prepare(`
-      INSERT INTO shared_memory (id, content, sourceAgent, confirmedBy, createdAt, isActive, supersedes, promotedFrom)
-      VALUES (?, ?, ?, ?, ?, 1, ?, ?)
-    `);
-    const update = this.db.prepare(`UPDATE shared_memory SET isActive = 0 WHERE id = ?`);
-    const tx = this.db.transaction(() => {
-      insert.run(
-        item.id,
-        item.content,
-        item.sourceAgent,
-        confirmedBy,
-        new Date().toISOString(),
-        supersedesId,
-        promotedFrom
-      );
-      if (supersedesId) {
-        update.run(supersedesId);
-      }
-    });
-    tx();
-  }
-
-  readActive(): SharedRow[] {
-    return this.db
-      .prepare(`SELECT * FROM shared_memory WHERE isActive = 1 ORDER BY createdAt DESC`)
-      .all() as SharedRow[];
-  }
-
-  readAll(): Array<SharedRow & { supersededBy: string | null }> {
-    const rows = this.db
-      .prepare(`SELECT * FROM shared_memory ORDER BY createdAt DESC`)
-      .all() as SharedRow[];
-    const bySupersedes = new Map<string, string>();
-    for (const r of rows) {
-      if (r.supersedes) bySupersedes.set(r.supersedes, r.id);
+    constructor(dataDir: string) {
+        this.db = new Database(path.join(dataDir, "shared.db"));
+        this.db.pragma("journal_mode = WAL");
     }
-    return rows.map((r) => ({ ...r, supersededBy: bySupersedes.get(r.id) ?? null }));
-  }
+
+    init(): void {
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS shared_memory (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                sourceAgent TEXT NOT NULL,
+                confirmedBy TEXT NOT NULL,
+                createdAt TEXT NOT NULL,
+                isActive INTEGER NOT NULL DEFAULT 1,
+                supersedes TEXT,
+                promotedFrom TEXT
+            )
+        `);
+    }
+
+    write(item: MemoryItem, confirmedBy: SourceAgent, supersedesId?: string, promotedFrom?: string): void {
+        const insert = this.db.prepare(`
+            INSERT OR REPLACE INTO shared_memory
+                (id, content, sourceAgent, confirmedBy, createdAt, isActive, supersedes, promotedFrom)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+        `);
+        const deactivate = this.db.prepare(`UPDATE shared_memory SET isActive = 0 WHERE id = ?`);
+
+        const transaction = this.db.transaction(() => {
+            insert.run(
+                item.id,
+                item.content,
+                item.sourceAgent,
+                confirmedBy,
+                new Date().toISOString(),
+                supersedesId ?? null,
+                promotedFrom ?? null,
+            );
+            if (supersedesId) {
+                deactivate.run(supersedesId);
+            }
+        });
+        transaction();
+    }
+
+    readActive(): SharedMemoryRow[] {
+        return this.db
+            .prepare(
+                `SELECT id, content, sourceAgent, confirmedBy, createdAt, isActive, supersedes, promotedFrom
+                 FROM shared_memory WHERE isActive = 1 ORDER BY createdAt ASC`,
+            )
+            .all() as SharedMemoryRow[];
+    }
+
+    readAll(): SharedMemoryRecord[] {
+        const rows = this.db
+            .prepare(
+                `SELECT id, content, sourceAgent, confirmedBy, createdAt, isActive, supersedes, promotedFrom
+                 FROM shared_memory ORDER BY createdAt ASC`,
+            )
+            .all() as SharedMemoryRow[];
+
+        const supersededBy = new Map<string, string>();
+        for (const row of rows) {
+            if (row.supersedes) {
+                supersededBy.set(row.supersedes, row.id);
+            }
+        }
+
+        return rows.map((row) => ({ ...row, supersededBy: supersededBy.get(row.id) ?? null }));
+    }
+
+    close(): void {
+        this.db.close();
+    }
 }
 
-export interface StoreBundle {
-  shared: SharedStore;
-  episodic: {
-    researcher: EpisodicStore;
-    synthesizer: EpisodicStore;
-  };
-}
-
-let cachedStores: StoreBundle | null = null;
-
-export async function getStores(): Promise<StoreBundle> {
-  if (cachedStores) return cachedStores;
-  const dataDir = resolveDataDir();
-  const shared = new SharedStore(path.join(dataDir, "shared.db"));
-  const researcher = new EpisodicStore("researcher", dataDir);
-  const synthesizer = new EpisodicStore("synthesizer", dataDir);
-  await researcher.init();
-  await synthesizer.init();
-  cachedStores = { shared, episodic: { researcher, synthesizer } };
-  return cachedStores;
-}
+// ---------------------------------------------------------------------------
+// Dispatch, promotion, retrieval
+// ---------------------------------------------------------------------------
 
 export async function handleMemoryItem(
-  item: MemoryItem,
-  stores: StoreBundle,
-  confirm: (item: MemoryItem) => Promise<ConfirmationResult>,
-  embedFn: (text: string) => Promise<number[]>
+    item: MemoryItem,
+    stores: Stores,
+    confirm: ConfirmFn,
+    embedText: EmbedFn,
 ): Promise<MemoryTier> {
-  const { tier, supersedesId } = await routeItem(item, confirm);
+    const route = await routeItem(item, confirm);
 
-  if (tier === "episodic" || tier === "held") {
-    const store = stores.episodic[item.sourceAgent];
-    const vector = await embedFn(item.content);
-    await store.write(item, vector, tier === "held");
-  } else if (tier === "shared") {
-    const other: SourceAgent =
-      item.sourceAgent === "researcher" ? "synthesizer" : "researcher";
-    stores.shared.write(item, other, supersedesId ?? null);
-  }
+    switch (route.tier) {
+        case "working":
+            return "working";
 
-  return tier;
+        case "episodic": {
+            const vector = await embedText(item.content);
+            await stores.episodic[item.sourceAgent].write(item, vector, false);
+            return "episodic";
+        }
+
+        case "held": {
+            const vector = await embedText(item.content);
+            await stores.episodic[item.sourceAgent].write(item, vector, true);
+            return "held";
+        }
+
+        case "shared": {
+            stores.shared.write(item, otherAgent(item.sourceAgent), route.supersedesId);
+            return "shared";
+        }
+    }
 }
 
 export async function checkForPromotion(
-  item: MemoryItem,
-  retrievalCount: number,
-  stores: StoreBundle,
-  confirm: (item: MemoryItem) => Promise<ConfirmationResult>
-): Promise<void> {
-  if (retrievalCount < KAPPA) return;
-  const result = await confirm(item);
-  if (result.confirmed) {
-    const other: SourceAgent =
-      item.sourceAgent === "researcher" ? "synthesizer" : "researcher";
-    stores.shared.write(item, other, result.supersedesId ?? null, item.id);
-    await stores.episodic[item.sourceAgent].delete(item.id);
-  }
+    item: MemoryItem,
+    retrievalCount: number,
+    shared: SharedStore,
+    confirm: ConfirmFn,
+    episodic?: EpisodicStore,
+): Promise<boolean> {
+    if (retrievalCount < KAPPA) {
+        return false;
+    }
+
+    const confirmation = await confirm(item);
+    if (!confirmation.confirmed) {
+        return false;
+    }
+
+    shared.write(item, otherAgent(item.sourceAgent), confirmation.supersedesId, item.id);
+
+    const store = episodic ?? (await getStores()).episodic[item.sourceAgent];
+    await store.delete(item.id);
+    return true;
 }
 
 export async function readEpisodicAndCheckPromotion(
-  agent: SourceAgent,
-  stores: StoreBundle,
-  queryText: string,
-  topK: number,
-  confirm: (item: MemoryItem) => Promise<ConfirmationResult>,
-  embedFn: (text: string) => Promise<number[]>
-): Promise<Array<EpisodicMetadata & { retrievalCount: number; kappa: number }>> {
-  const store = stores.episodic[agent];
-  const queryVector = await embedFn(queryText);
-  const results = await store.read(queryVector, topK);
+    agent: SourceAgent,
+    episodic: EpisodicStore,
+    shared: SharedStore,
+    queryText: string,
+    topK: number,
+    confirm: ConfirmFn,
+    embedText: EmbedFn,
+): Promise<RetrievedEpisodicEntry[]> {
+    const queryVector = await embedText(queryText);
+    const entries = await episodic.read(queryVector, topK);
 
-  const augmented: Array<EpisodicMetadata & { retrievalCount: number; kappa: number }> = [];
-  for (const r of results) {
-    const count = store.bumpRetrievalCount(r.id);
-    const item: MemoryItem = {
-      id: r.id,
-      content: r.content,
-      persistence: 1,
-      scope: 1,
-      sourceAgent: r.sourceAgent,
-    };
-    await checkForPromotion(item, count, stores, confirm);
-    augmented.push({ ...r, retrievalCount: count, kappa: KAPPA });
-  }
-  return augmented;
+    const results: RetrievedEpisodicEntry[] = [];
+    for (const entry of entries) {
+        const retrievalCount = await episodic.bumpRetrievalCount(entry.id);
+        const item: MemoryItem = {
+            id: entry.id,
+            content: entry.content,
+            persistence: entry.persistence,
+            scope: entry.scope,
+            sourceAgent: agent,
+        };
+
+        try {
+            await checkForPromotion(item, retrievalCount, shared, confirm, episodic);
+        } catch (error) {
+            // A promotion failure must not take down the run.
+            console.warn("promotion check failed", error);
+        }
+
+        results.push({ ...entry, sourceAgent: agent, retrievalCount, kappa: KAPPA });
+    }
+
+    return results;
+}
+
+// ---------------------------------------------------------------------------
+// Process-level store cache
+// ---------------------------------------------------------------------------
+
+let storesPromise: Promise<Stores> | null = null;
+
+export function getStores(): Promise<Stores> {
+    if (!storesPromise) {
+        storesPromise = (async () => {
+            const dataDir = resolveDataDir();
+
+            const shared = new SharedStore(dataDir);
+            shared.init();
+
+            const researcher = new EpisodicStore(dataDir, "researcher");
+            const synthesizer = new EpisodicStore(dataDir, "synthesizer");
+            await researcher.init();
+            await synthesizer.init();
+
+            return { shared, episodic: { researcher, synthesizer } };
+        })().catch((error) => {
+            storesPromise = null;
+            throw error;
+        });
+    }
+    return storesPromise;
 }
