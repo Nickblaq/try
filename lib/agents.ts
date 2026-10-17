@@ -16,7 +16,7 @@ const client = new OpenAI({
   apiKey: "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",
 });
 
-const MODEL = "meta-llama/llama-3.3-70b-instruct:free";
+const MODEL = "openrouter/free";
 
 export interface MemoryLogEntry {
   id: string;
