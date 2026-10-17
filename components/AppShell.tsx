@@ -7,7 +7,7 @@ import { usePathname } from "next/navigation";
 // op, yt, design, test). There is one product now — the catalog studio — so the
 // nav is just the landing page and the single entry point into it.
 const NAV_ITEMS = [
-  { href: "/", label: "home" },
+  { href: "/hmd", label: "hmd" },
   { href: "/cufx", label: "cufx" },
 ] as const;
 
@@ -18,9 +18,8 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     <div className="root">
       <header className="topbar">
         <Link href="/" className="wordmark" aria-label="cufx home">
-          cufx
+          try
         </Link>
-        <span className="wordmarkSub">operation catalog</span>
         <nav className="nav" aria-label="Primary">
           {NAV_ITEMS.map((item) => {
             const active =
@@ -44,7 +43,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       <main className="shellMain">{children}</main>
 
       <footer className="footer">
-        <span>Next.js · ffmpeg · sharp · yt-dlp · SQLite catalog</span>
+        <span>Swiss Knife app</span>
       </footer>
 
       <style jsx>{`
