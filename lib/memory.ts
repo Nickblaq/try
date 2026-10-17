@@ -6,8 +6,8 @@ import path from "path";
 import fs from "fs";
 
 const client = new OpenAI({
-  baseURL: "https://openrouter.ai/api/v1",
-  apiKey: process.env.OPENROUTER_API_KEY,
+  baseURL: "https://openrouter.ai/api/v1/chat/completions",
+  apiKey: "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",
 });
 
 const MODEL = "meta-llama/llama-3.3-70b-instruct:free";
