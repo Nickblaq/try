@@ -7,6 +7,7 @@ import { usePathname } from "next/navigation";
 // op, yt, design, test). There is one product now — the catalog studio — so the
 // nav is just the landing page and the single entry point into it.
 const NAV_ITEMS = [
+  { href: "/", label: "Try" },
   { href: "/hmd", label: "hmd" },
   { href: "/cufx", label: "cufx" },
 ] as const;
@@ -47,6 +48,10 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       </footer>
 
       <style jsx>{`
+        .landing {
+          margin: 0 auto;
+          padding: 0 20px;
+        }
         .topbar {
           display: flex;
           align-items: center;
