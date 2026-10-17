@@ -15,7 +15,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname() ?? "";
 
   return (
-    <div className="root">
+    <div className="landing">
       <header className="topbar">
         <Link href="/" className="wordmark" aria-label="cufx home">
           try
