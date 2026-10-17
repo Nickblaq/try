@@ -23,11 +23,12 @@ import {
     toMemoryItem,
 } from "./memory";
 
-const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
-const CHAT_MODEL = "openRouter/free";
+const client = new OpenAI({
+  baseURL: "https://openrouter.ai/api/v1/chat/completions",
+  apiKey: "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",
+});
 
-const OBSERVATION_COUNT = 3;
-const EPISODIC_TOP_K = 5;
+const MODEL = "openrouter/free";
 
 export interface AgentContext {
     stores: Stores;
