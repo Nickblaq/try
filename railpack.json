@@ -2,8 +2,8 @@
   "$schema": "https://schema.railpack.com",
   "provider": "node",
   "packages": {
-    "node": "22",
-    "python": "3.13"
+    "node": "24.22",
+    "python": "3.16"
   },
   "steps": {
     "install": {
