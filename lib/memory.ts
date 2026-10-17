@@ -148,7 +148,7 @@ function fnv1a(str: string): number {
 }
 
 export function tfidfVector(text: string, dim = 256): number[] {
-  const vector = new Array(dim).fill(0);
+  const vector = new Array<number>(dim).fill(0);
   const tokens = text
     .toLowerCase()
     .split(/[^a-z0-9]+/)
@@ -214,6 +214,17 @@ export interface EpisodicMetadata {
   heldFromShared?: boolean;
 }
 
+function asEpisodic(meta: unknown): EpisodicMetadata {
+  const m = (typeof meta === "object" && meta !== null ? meta : {}) as Record<string, unknown>;
+  const sourceAgent: SourceAgent = m.sourceAgent === "synthesizer" ? "synthesizer" : "researcher";
+  return {
+    id: typeof m.id === "string" ? m.id : String(m.id ?? ""),
+    content: typeof m.content === "string" ? m.content : String(m.content ?? ""),
+    sourceAgent,
+    heldFromShared: m.heldFromShared === true,
+  };
+}
+
 export class EpisodicStore {
   private index: LocalIndex;
   private countsPath: string;
@@ -231,7 +242,7 @@ export class EpisodicStore {
     }
     try {
       const raw = fs.readFileSync(this.countsPath, "utf-8");
-      this.counts = JSON.parse(raw);
+      this.counts = JSON.parse(raw) as Record<string, number>;
     } catch {
       this.counts = {};
     }
@@ -251,12 +262,12 @@ export class EpisodicStore {
 
   async read(queryVector: number[], topK: number): Promise<EpisodicMetadata[]> {
     const results = await this.index.queryItems(queryVector, "", topK);
-    return results.map((r) => r.item.metadata as EpisodicMetadata);
+    return results.map((r) => asEpisodic(r.item.metadata));
   }
 
   async delete(id: string): Promise<void> {
     const items = await this.index.listItems();
-    const found = items.find((i) => (i.metadata as EpisodicMetadata).id === id);
+    const found = items.find((i) => asEpisodic(i.metadata).id === id);
     if (found) {
       await this.index.deleteItem(found.id);
     }
@@ -286,7 +297,7 @@ export class EpisodicStore {
   > {
     const items = await this.index.listItems();
     return items.map((i) => {
-      const meta = i.metadata as EpisodicMetadata;
+      const meta = asEpisodic(i.metadata);
       return {
         ...meta,
         retrievalCount: this.counts[meta.id] ?? 0,
