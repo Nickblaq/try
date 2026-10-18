@@ -1,16 +1,13 @@
+// lib/memory.ts
 import { z } from "zod";
 import { LocalIndex } from "vectra";
 import Database from "better-sqlite3";
-import OpenAI from "openai";
 import path from "path";
 import fs from "fs";
+import { OPENROUTER_API_KEY, OPENROUTER_MODEL } from "./config";
 
-const client = new OpenAI({
-  baseURL: "https://openrouter.ai/api/v1/chat/completions",
-  apiKey: "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",
-});
-
-const MODEL = "meta-llama/llama-3.3-70b-instruct:free";
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+const OPENROUTER_EMBEDDINGS_URL = "https://openrouter.ai/api/v1/embeddings";
 
 export const THETA_P = 0.4;
 export const THETA_S = 0.55;
@@ -107,7 +104,7 @@ export function resolveDataDir(): string {
 }
 
 interface EmbeddingMode {
-  mode: "openai" | "tfidf";
+  mode: "openrouter" | "tfidf";
   dim: number;
 }
 
@@ -121,7 +118,10 @@ function loadEmbeddingMode(): EmbeddingMode | null {
   try {
     const raw = fs.readFileSync(embeddingModePath(), "utf-8");
     const parsed = JSON.parse(raw) as EmbeddingMode;
-    if ((parsed.mode === "openai" || parsed.mode === "tfidf") && typeof parsed.dim === "number") {
+    if (
+      (parsed.mode === "openrouter" || parsed.mode === "tfidf") &&
+      typeof parsed.dim === "number"
+    ) {
       return parsed;
     }
     return null;
@@ -171,21 +171,37 @@ export function tfidfVector(text: string, dim = 256): number[] {
   return vector;
 }
 
+async function callOpenRouterEmbeddings(text: string): Promise<number[]> {
+  const response = await fetch(OPENROUTER_EMBEDDINGS_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "openai/text-embedding-3-small",
+      input: text,
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`Embeddings error: ${response.status}`);
+  }
+  const data = await response.json();
+  const embedding: unknown = data?.data?.[0]?.embedding;
+  if (!Array.isArray(embedding) || embedding.length === 0) {
+    throw new Error("Empty embedding");
+  }
+  return embedding as number[];
+}
+
 async function initializeEmbeddingMode(): Promise<EmbeddingMode> {
   const persisted = loadEmbeddingMode();
   if (persisted) return persisted;
   try {
-    const res = await client.embeddings.create({
-      model: "text-embedding-3-small",
-      input: "probe",
-    });
-    const dim = res.data[0]?.embedding?.length ?? 0;
-    if (dim > 0) {
-      const mode: EmbeddingMode = { mode: "openai", dim };
-      saveEmbeddingMode(mode);
-      return mode;
-    }
-    throw new Error("empty embedding");
+    const probe = await callOpenRouterEmbeddings("probe");
+    const mode: EmbeddingMode = { mode: "openrouter", dim: probe.length };
+    saveEmbeddingMode(mode);
+    return mode;
   } catch {
     const mode: EmbeddingMode = { mode: "tfidf", dim: 256 };
     saveEmbeddingMode(mode);
@@ -197,12 +213,8 @@ export async function embed(text: string): Promise<number[]> {
   if (!cachedEmbeddingMode) {
     cachedEmbeddingMode = await initializeEmbeddingMode();
   }
-  if (cachedEmbeddingMode.mode === "openai") {
-    const res = await client.embeddings.create({
-      model: "text-embedding-3-small",
-      input: text,
-    });
-    return res.data[0].embedding;
+  if (cachedEmbeddingMode.mode === "openrouter") {
+    return callOpenRouterEmbeddings(text);
   }
   return tfidfVector(text, cachedEmbeddingMode.dim);
 }
