@@ -1,6 +1,7 @@
-import OpenAI from "openai";
+// lib/agents.ts
 import crypto from "crypto";
 import { z } from "zod";
+import { OPENROUTER_API_KEY, OPENROUTER_MODEL } from "./config";
 import {
   type MemoryItem,
   type ConfirmationResult,
@@ -11,12 +12,7 @@ import {
   readEpisodicAndCheckPromotion,
 } from "./memory";
 
-const client = new OpenAI({
-  baseURL: "https://openrouter.ai/api/v1/chat/completions",
-  apiKey: "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",
-});
-
-const MODEL = "openrouter/free";
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 
 export interface MemoryLogEntry {
   id: string;
@@ -104,20 +100,37 @@ Observations:
 ${observations.map((o) => `- ${o}`).join("\n")}`;
 }
 
+interface ChatMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
 async function callModel(
   system: string,
   user: string,
   jsonMode: boolean
 ): Promise<string> {
-  const res = await client.chat.completions.create({
-    model: MODEL,
-    messages: [
-      { role: "system", content: system },
-      { role: "user", content: user },
-    ],
-    ...(jsonMode ? { response_format: { type: "json_object" as const } } : {}),
+  const messages: ChatMessage[] = [
+    { role: "system", content: system },
+    { role: "user", content: user },
+  ];
+  const response = await fetch(OPENROUTER_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: OPENROUTER_MODEL,
+      messages,
+      ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
+    }),
   });
-  return res.choices[0]?.message?.content ?? "";
+  if (!response.ok) {
+    throw new Error(`OpenRouter error: ${response.status}`);
+  }
+  const data = await response.json();
+  return data?.choices?.[0]?.message?.content ?? "";
 }
 
 export async function runResearcher(task: string, ctx: AgentContext): Promise<string> {
